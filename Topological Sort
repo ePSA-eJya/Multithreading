@@ -1,0 +1,721 @@
+ # Thread-Safe Parallel Topological Sort: Interview Notes
+
+Oct 23, 2026 · @Epsa Sharma
+
+## The problem
+
+These notes follow the order I actually reasoned through in the mock interview: my first idea, what was wrong with it, and the fix. Each step ends with a **Takeaway** worth memorizing.
+
+A DAG of tasks, where an edge `A → B` means B cannot start until A finishes. Build a system with **N worker threads** that:
+
+1. Runs a node only when all its parents have finished.
+2. After finishing a node, updates its children so newly unblocked ones become available.
+3. Records a valid topological order (the order nodes finished).
+4. Keeps workers busy, with no lost nodes, no double processing, no deadlocks and no busy-spinning.
+
+**Example graph** (reused throughout): nodes A, B, C, D, E with edges `A→C`, `B→C`, `C→D`, `B→E`. A and B start ready. C waits for both. E only needs B. One valid order: `A B E C D`.
+
+## Step 1: From Kahn's algorithm to a worker pool
+
+**My first idea.** Use Kahn's algorithm: put all in-degree-0 nodes in a queue. Pop them, spawn a thread per node, and have each thread push children that become ready.
+
+**What was wrong:**
+
+- **A thread per node does not scale.** 100,000 ready nodes would mean 100,000 threads. The problem asks for a fixed pool of N.
+- **Batching by level wastes parallelism.** If I pop a whole level and wait for it, E (which only needs B) waits for slow A too.
+
+**The fix.** N long-lived workers loop forever: take one ready node, process it, update its children, repeat. Work is pulled continuously, so E runs the moment B finishes.
+
+**Shared state** the workers need:
+
+| State | Purpose |
+| --- | --- |
+| Ready queue | Nodes whose dependencies are all done |
+| In-degree per node | How many parents are still unfinished |
+| Completed count | To know when the whole job is done |
+| Result order | The finish order to return |
+
+**Takeaway:** fixed pool + continuous pulling. Never spawn per task, never wait on a whole level.
+
+## Step 2: The in-degree race
+
+**My first idea.** Keep a visited set next to the queue. Before pushing a child, lock the set; if the child is already in it, skip the push.
+
+**What was wrong.** The set stops a *duplicate push*, but the real bug is a **lost update** on the counter. C has in-degree 2, and A and B finish together:
+
+```
+Thread A: reads inDegree[C] = 2
+Thread B: reads inDegree[C] = 2
+Thread A: writes 1
+Thread B: writes 1      <- lost update
+```
+
+C stays at 1 forever. Nobody pushes it, C and D never run, and workers wait forever.
+
+**The fix.** Make "decrement and check for zero" one indivisible step, so exactly one thread sees the count hit 0:
+
+| Option | How | Trade-off |
+| --- | --- | --- |
+| One global lock | Lock around every decrement | Correct, but all workers contend on one lock |
+| Lock per node (my choice) | `vector<mutex> locks(n)`; lock `locks[v]`, decrement, check | Threads only contend when they share a child |
+| Atomic counter | `if (indegree[v].fetch_sub(1) == 1) push(v);` | No lock at all; cheapest |
+
+With any of these, the visited set is unnecessary.
+
+**Takeaway:** when two threads update the same counter, trace it step by step (read, read, write, write). The check must use the result of the same atomic step as the decrement.
+
+## Step 3: Knowing when to stop
+
+**My first idea.** Stop when the visited set's size equals N.
+
+**What was wrong.** "Every node has been *enqueued*" is not "every node has been *processed*". When the last node D is pushed, the set is full, but D is still in the queue or running.
+
+**Second idea (correct).** Count a node as done only **after** it has finished updating all its children. Stop when `done == n`. The order matters: counting before pushing children could reach N while a child is still unpushed. The counter is shared, so it needs a lock or an atomic.
+
+**Waking the blocked workers.** When the count hits N, the other workers are asleep waiting on an empty queue. My fix: a `stop` flag plus `cv.notify_all()`. Every waiter wakes, sees `stop`, and returns.
+
+Three condition-variable rules to get this right:
+
+1. **Same lock.** `stop` and the queue are guarded by the same mutex the condition variable uses. Otherwise a worker can check "empty, not stopped", get preempted, miss the `notify_all`, and sleep forever (a **lost wakeup**).
+2. **`while`, not `if`.** Wait in a loop, or use the predicate form: `cv.wait(lock, [&]{ return !q.empty() || stop; });`. This handles spurious wakeups and another worker grabbing the item first.
+3. **Re-check after waking.** If you woke because of `stop`, the queue is empty: `if (q.empty()) return;` before touching `q.front()`.
+
+Also call `cv.notify_one()` after every push, or sleeping workers never learn that a node became ready.
+
+**Why not `BlockingQueue.take()`?** A thread blocked inside `take()` cannot see your `stop` flag. Either manage the queue yourself with mutex + condition variable, or push one "poison pill" item per worker.
+
+**Takeaway:** stop on *processed* count, not *enqueued* count. Wait with a predicate, notify after every change a waiter cares about.
+
+## Step 4: Bug log from my three code attempts
+
+My design was right before my code was. These are the mistakes I made, so I can check for them next time.
+
+**Concurrency bugs** (crash, hang or wrong result):
+
+| Bug | Effect | Fix |
+| --- | --- | --- |
+| `q.front()` with no wait | Undefined behavior on an empty queue | `cv.wait` with a predicate |
+| `q.front()` after waking on `stop` | Undefined behavior at shutdown | `if (q.empty()) return;` after the wait |
+| `q.push()` under the node lock, not the queue lock | Two pushers corrupt the queue | Take the queue mutex `m` to push |
+| No `notify_one()` after a push | Other workers sleep while work waits; runs on one thread | Notify after every push |
+| `if (stop) return;` outside the lock | Data race | Delete it; the wait predicate checks `stop` |
+| Shared state as local variables | Threads share nothing | Put state in a class; threads run a member function |
+| `vector<vector<node>>` adjacency with a mutex in each copy | C has a different mutex in A's list and B's list, so the lost update returns | Exactly one mutex per node: `vector<mutex> locks(n)` |
+| Order appended after pushing children | A child can be recorded before its parent | Record `u` before releasing children |
+
+**C++ mechanics** (won't compile or crashes at exit):
+
+- `mutex` cannot be copied or moved, so `queue<node>`, `auto nn = q.front()` and `for (auto it : list)` fail. Use `int` ids, or `Node*` pointers.
+- `vector<int> indegree(n, 0)` is not valid as an in-class member initializer. Size it in the constructor's initializer list.
+- Declaring `unique_lock<mutex> lock` twice in the same scope is a redeclaration error. Give each critical section its own `{ }` block.
+- `class` members are private by default; add `public:`.
+- `thread t(topo)` fails for a member function. Use `workers.emplace_back(&TopoSort::topo, this)`.
+- A `std::thread` destroyed without `join()` calls `std::terminate`. Store threads in a vector and join them all.
+- `thread::hardware_concurrency()` is a static function and needs `()`.
+
+**Takeaway:** a lock protects data only if every thread uses the *same lock object*. For per-object locks, ask: how many instances of this mutex exist per piece of data? The answer must be one.
+
+## Step 5: Final reference solution
+
+This is my design (per-node mutexes plus a separate order lock) with every bug fixed. It compiled and passed 200 randomized trials under ThreadSanitizer with no data races and a valid order every time.
+
+```
+class TopoSort {
+public:
+    TopoSort(const vector<vector<int>>& adj)
+        : n(adj.size()), adj(adj), indegree(n, 0), locks(n) {
+        for (int u = 0; u < n; ++u)
+            for (int v : adj[u]) indegree[v]++;
+        for (int u = 0; u < n; ++u)
+            if (indegree[u] == 0) q.push(u);
+        if (n == 0) stop = true;                 // empty graph
+    }
+
+    vector<int> run(int numThreads) {
+        vector<thread> workers;
+        for (int i = 0; i < numThreads; ++i)
+            workers.emplace_back(&TopoSort::topo, this);
+        for (auto& w : workers) w.join();
+        return order;
+    }
+
+private:
+    void process(int u) { /* real work */ }
+
+    void topo() {
+        while (true) {
+            int nn;
+            {   // 1. take a ready node
+                unique_lock<mutex> lock(m);
+                cv.wait(lock, [&] { return !q.empty() || stop; });
+                if (q.empty()) return;           // woke for stop
+                nn = q.front(); q.pop();
+            }
+
+            process(nn);// 2. real work, no lock held
+
+            {   // 3. record BEFORE releasing children
+                lock_guard<mutex> olock(ord);
+                order.push_back(nn);
+            }
+
+            for (int it : adj[nn]) {// 4. release children
+                bool ready;
+                {
+                    lock_guard<mutex> nlock(locks[it]);// ONE mutex per node
+                    ready = (--indegree[it] == 0);
+                }
+                if (ready) {
+                    { lock_guard<mutex> qlock(m); q.push(it); }
+                    cv.notify_one();
+                }
+            }
+
+            {   // 5. count completion AFTER children are pushed
+                lock_guard<mutex> lock(m);
+                if (++tot == n) { stop = true; cv.notify_all(); }
+            }
+        }
+    }
+
+    int n;
+    vector<vector<int>> adj;
+    vector<int> indegree;
+    vector<mutex> locks;      // locks[v] guards indegree[v]
+    queue<int> q;
+    mutex m;                  // guards q, tot, stop
+    condition_variable cv;
+    int tot = 0;
+    bool stop = false;
+    mutex ord;                // guards order
+    vector<int> order;
+};
+
+int main() {
+    vector<vector<int>> adj = {{2}, {2, 4}, {3}, {}, {}};   // A..E
+    TopoSort t(adj);
+    auto order = t.run(max(1u, thread::hardware_concurrency()));
+    for (int x : order) cout << char('A' + x) << ' ';
+}
+```
+
+**The five steps of the worker loop** are the part to memorize: take, process, record, release children, count.
+
+**Atomic variant.** Replace `indegree` and `locks` with `vector<atomic<int>> indegree(n)`, and step 4 becomes:
+
+```cpp
+for (int v : adj[nn])
+    if (indegree[v].fetch_sub(1) == 1) {
+        { lock_guard<mutex> qlock(m); q.push(v); }
+        cv.notify_one();
+    }
+```
+
+**Lock order.** A node lock and `m` are never held together, so no deadlock is possible. If you ever nest them, always take them in the same order (node lock, then `m`).
+
+## Step 6: The same solution on a reusable thread pool
+
+Step 5 already uses a pool: N threads that loop over a shared queue. But that pool is hard-wired into the algorithm. Here it's split into a **generic `ThreadPool`** (runs any task) and a **`TopoSort`** that only submits tasks. Finishing a node submits its newly ready children as new tasks.
+
+I compiled it and ran 200 randomized trials under ThreadSanitizer on one reused pool: no data races, and every order was valid.
+
+```
+class ThreadPool {
+public:
+    ThreadPool(size_t numThreads) {
+        for (size_t i = 0; i < numThreads; ++i)
+            workers.emplace_back([this] { loop(); });
+    }
+
+    ~ThreadPool() {// drain remaining tasks, then stop
+        { lock_guard<mutex> lk(m); stop = true; }
+        cv.notify_all();
+        for (auto& w : workers) w.join();
+    }
+
+    void submit(function<void()> task) {
+        { lock_guard<mutex> lk(m); tasks.push(move(task)); }
+        cv.notify_one();
+    }
+
+private:
+    void loop() {
+        while (true) {
+            function<void()> task;
+            {
+                unique_lock<mutex> lk(m);
+                cv.wait(lk, [&] { return stop || !tasks.empty(); });
+                if (tasks.empty()) return;             // stop && nothing left
+                task = move(tasks.front());
+                tasks.pop();
+            }
+            task();                                    // run with no lock held
+        }
+    }
+
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex m;
+    condition_variable cv;
+    bool stop = false;
+};
+
+class TopoSort {
+public:
+    TopoSort(const vector<vector<int>>& adj)
+        : n(adj.size()), adj(adj), indegree(n, 0), locks(n) {
+        for (int u = 0; u < n; ++u)
+            for (int v : adj[u]) indegree[v]++;
+    }
+
+    vector<int> run(ThreadPool& pool) {
+        vector<int> roots;                              // collect FIRST, then submit
+        for (int u = 0; u < n; ++u)
+            if (indegree[u] == 0) roots.push_back(u);
+        for (int u : roots) submitNode(u, pool);
+
+        unique_lock<mutex> lk(doneM);                  // block until every node is done
+        doneCv.wait(lk, [&] { return done == n; });
+        return order;
+    }
+
+private:
+    void process(int u) { /* real work */ }
+
+    void submitNode(int u, ThreadPool& pool) {
+        pool.submit([this, u, &pool] { execute(u, pool); });
+    }
+
+    void execute(int u, ThreadPool& pool) {            // one task = one node
+        process(u);
+        { lock_guard<mutex> lk(orderM); order.push_back(u); }
+
+        for (int v : adj[u]) {
+            bool ready;
+            {
+                lock_guard<mutex> lk(locks[v]);
+                ready = (--indegree[v] == 0);
+            }
+            if (ready) submitNode(v, pool);            // child becomes a new task
+        }
+
+        lock_guard<mutex> lk(doneM);
+        if (++done == n) doneCv.notify_one();
+    }
+
+    int n;
+    vector<vector<int>> adj;
+    vector<int> indegree;
+    vector<mutex> locks;       // locks[v] guards indegree[v]
+    mutex orderM;              // guards order
+    vector<int> order;
+    mutex doneM;               // guards done
+    condition_variable doneCv;
+    int done = 0;
+};
+
+int main() {
+    vector<vector<int>> adj = {{2}, {2, 4}, {3}, {}, {}};   // A..E
+    ThreadPool pool(max(1u, thread::hardware_concurrency()));
+    TopoSort t(adj);
+    for (int x : t.run(pool)) cout << char('A' + x) << ' ';
+}
+```
+
+**What changed compared with Step 5:**
+
+|  | Step 5 (hand-rolled workers) | Step 6 (thread pool) |
+| --- | --- | --- |
+| Ready queue + its condition variable | Inside `TopoSort` | Inside `ThreadPool` (the task queue) |
+| Stopping workers | `stop` flag when `tot == n` | Pool destructor; the sort just waits on `done == n` |
+| Unit of work | Worker pops a node id | Pool runs a task: `execute(u)` |
+| Reuse | Threads die after one sort | One pool runs many sorts, or other jobs |
+
+**Subtleties to mention in an interview:**
+
+- **Collect roots before submitting.** If `run()` scanned `indegree` while tasks were already running, a node a worker just dropped to 0 could be submitted twice (once by the scan, once by the worker). Collecting roots first avoids that.
+- **Lifetime.** Tasks capture `this` and `&pool`, so `TopoSort` and the pool must outlive every task. `run()` blocks until `done == n`, which guarantees that.
+- **Cycles hang `run()`.** Cycle nodes are never submitted, so `done` never reaches n. Use the Kahn pre-check, or track in-flight tasks and stop when none remain with `done < n`.
+- **Cost.** Each task is a `std::function`, which may allocate. That's fine when `process()` does real work; for tiny tasks it adds overhead.
+- **Priority version.** Swap the pool's `queue` for a `priority_queue` of `{key, task}`.
+
+## Step 7: Same pattern as my web crawler
+
+This follows my crawler's design: the class owns the threads, each thread runs `while (task());`, and a `work` counter of in-flight nodes decides when to stop. One mutex `m` guards all the bookkeeping. It passed 200 ThreadSanitizer runs, plus cycle, full-cycle and empty-graph tests.
+
+```
+class TopoSort {
+private:
+    int n, work = 0, done = 0;
+    vector<vector<int>> adj;
+    vector<int> indegree;
+    queue<int> q;
+    bool stop = false, cycle = false;
+    vector<thread> threads;
+    mutex m;
+    condition_variable cv;
+
+    void process(int u) { /* real work */ }
+
+public:
+    vector<int> order;
+
+    TopoSort(int nt, const vector<vector<int>>& g)
+        : n(g.size()), adj(g), indegree(n, 0) {
+        for (int u = 0; u < n; u++)
+            for (int v : adj[u]) indegree[v]++;
+        for (int u = 0; u < n; u++)
+            if (indegree[u] == 0) q.push(u);
+        if (q.empty()) { stop = true; cycle = (n > 0); }// empty graph, or all cycle
+
+        // start threads LAST, after the queue is ready
+        for (int i = 0; i < nt; i++)
+            threads.emplace_back([this] { while (task()); });
+    }
+
+    ~TopoSort() {
+        unique_lock<mutex> lock(m);
+        stop = true;
+        lock.unlock();
+        cv.notify_all();
+        for (auto& th : threads)
+            if (th.joinable()) th.join();
+    }
+
+    vector<int> sort() {
+        for (auto& th : threads)
+            if (th.joinable()) th.join();
+        if (cycle) throw runtime_error("graph has a cycle");
+        return order;
+    }
+
+    bool task() {
+        unique_lock<mutex> lock(m);
+        cv.wait(lock, [&] { return !q.empty() || stop; });
+        if (stop) return false;
+
+        int u = q.front();
+        q.pop();
+        work++;                            // u is now in flight
+        lock.unlock();
+
+        process(u);                        // no lock held
+
+        lock.lock();
+        order.push_back(u);                // record BEFORE releasing children
+        int pushed = 0;
+        for (int v : adj[u])
+            if (--indegree[v] == 0) { q.push(v); pushed++; }
+        work--;
+        done++;
+        if (q.empty() && work == 0) {      // nothing queued, nothing running
+            stop = true;
+            cycle = (done < n);            // stalled early = cycle
+        }
+        bool finished = stop;
+        lock.unlock();
+
+        if (finished) cv.notify_all();
+        else for (int i = 0; i < pushed; i++) cv.notify_one();
+        return true;
+    }
+};
+
+int main() {
+    vector<vector<int>> adj = {{2}, {2, 4}, {3}, {}, {}};   // A..E
+    TopoSort t(max(1u, thread::hardware_concurrency()), adj);
+    for (int x : t.sort()) cout << char('A' + x) << ' ';
+}
+```
+
+**How it maps to the crawler:**
+
+| Crawler | Topo sort |
+| --- | --- |
+| Queue of URLs | Queue of ready nodes |
+| Visited set `s` decides what gets pushed | `indegree == 0` decides what gets pushed |
+| `geturls(url)` | `process(u)`, then walk `adj[u]` |
+| Stop when `q.empty() && work == 0` | Same check |
+| (no equivalent) | `done < n` at that point means a cycle |
+
+**Notes:**
+
+- **Termination detects cycles for free.** `q.empty() && work == 0` is the stall check from Follow-up 1, so there's no separate `tot == n` test.
+- **One lock instead of per-node locks.** Simpler, and the critical sections are tiny next to `process()`. If profiling showed contention on `m`, move in-degrees to atomics (Step 2).
+- **Notify only what's needed.** `notify_one()` per pushed child, `notify_all()` only on stop. Calling `notify_all()` after every task (as the crawler does) works, but wakes every sleeper each time (a "thundering herd").
+
+## Deep dives: questions I asked along the way
+
+### Why does `fetch_sub` give exactly one thread the 1 → 0?
+
+`fetch_sub` is an atomic **read-modify-write**: read, subtract and write happen as one indivisible step (`lock xadd` on x86). It returns the value from just before *its own* subtraction. All read-modify-writes on one atomic are applied one at a time, so each old value is handed out exactly once:
+
+```
+Thread A: fetch_sub -> returns 2, value now 1
+Thread B: fetch_sub -> returns 1, value now 0   <- only B sees 1
+```
+
+The trap: `indegree[v]--; if (indegree[v] == 0)`. Each line is atomic, but the pair is not, so both threads can read 0 and push C twice. Always use the **return value**.
+
+Memory order: keep the default `seq_cst` (or `acq_rel`) so earlier parents' work is visible to whoever processes C. `relaxed` keeps the count right but loses that guarantee.
+
+### Should `order` have its own lock?
+
+Yes. `order` has nothing to do with the queue or the wait condition, so sharing `m` adds contention for no reason. It stays correct because the append happens before the same thread pushes the children. `q`, `stop`, `tot` (and `active` for cycles) must stay under `m`, because they feed the wait predicate and the termination check together.
+
+Lock-free option: preallocate `vector<int> order(n)` and an `atomic<int> pos`, then `order[pos.fetch_add(1)] = u;`. Each thread writes its own slot, and `join()` makes the writes visible.
+
+Interview line: "A separate lock reduces contention, but I'd measure before optimizing."
+
+### Doesn't the atomic decrement kill concurrency?
+
+No. It only serializes operations on the **same** counter, for nanoseconds, and nobody sleeps. Decrements of different children run fully in parallel. The ordering it imposes (who finished last) is required by the dependency anyway. The real time goes into `process(u)`, which holds no lock.
+
+When it can cost something:
+
+- **High fan-in.** 1,000 parents of one sink all hit one counter; its cache line moves between cores on each decrement.
+- **False sharing.** `vector<atomic<int>>` packs 16 counters per 64-byte cache line. Fix only if profiling shows it: `struct alignas(64) PaddedCounter { atomic<int> v; };`.
+
+The bigger bottleneck is the single queue mutex `m`. The next step for scale is per-worker queues with **work stealing** (as in TBB and Go's scheduler).
+
+### If a mutex can't be copied, how do concurrent linked structures work?
+
+Never copy the node; pass pointers to it. Allocate each node once on the heap, so its mutex has one fixed address, and store `Node*` everywhere.
+
+```
+struct Node {
+    int val;
+    (
+    mutex m;
+    Node(int v) : val(v) {}
+};
+
+// Hand-over-hand insert into a sorted list
+void insert(int v) {
+    Node* prev = &head;            // sentinel node
+    prev->m.lock();
+    Node* cur = prev->next;
+    while (cur) {
+        cur->m.lock();             // lock next...
+        if (cur->val >= v) break;
+        prev->m.unlock();          // ...then release the one behind
+        prev = cur;
+        cur = cur->next;
+    }
+    Node* n = new Node(v);
+    n->next = cur;
+    prev->next = n;
+    if (cur) cur->m.unlock();
+    prev->m.unlock();
+}
+```
+
+Each thread holds at most two adjacent locks, always front to back, so there's no deadlock. (Deleting is harder: you can't free a node another thread is waiting to lock. That's what hazard pointers and epoch-based reclamation solve.)
+
+For the topo sort, the same idea looks like `vector<unique_ptr<Node>> nodes` (owns each node once) plus `vector<Node*> children` and `queue<Node*>`. Use int ids when nodes are numbered 0..n-1. Use pointers when the structure changes shape or nodes carry a lot of data.
+
+## Follow-up 1: What if the graph has a cycle?
+
+**My first idea.** Keep a visited set and flag a cycle if a node is popped twice.
+
+**What was wrong.** That's how DFS finds cycles, not Kahn's. In Kahn's, a node in a cycle always waits on another node in the same cycle, so its in-degree never reaches 0. It is **never pushed and never popped**, so a visited set never sees a repeat.
+
+**The symptom** is a hang. Graph `X → A`, plus the cycle `A → B → C → A`. X runs and drops A from 2 to 1. Now the queue is empty, nobody is working, and `done = 1 < n = 4`. All workers wait forever.
+
+**Second idea (correct).** If the queue is empty and nobody is working, nothing can ever become ready again. Make it precise by counting **active** workers (holding a node), not sleeping ones:
+
+```cpp
+int active = 0;
+bool cycle = false;
+
+// when popping (under m):
+++active;
+
+// at the end of the iteration (under m):
+--active;
+++done;
+if (done == n) {
+    stop = true; cv.notify_all();                 // success
+} else if (q.empty() && active == 0) {
+    cycle = true; stop = true; cv.notify_all();   // stuck: cycle
+}
+```
+
+`run()` then checks `cycle` and reports an error. Edge case: if the whole graph is a cycle, nothing is ever pushed, so check `q.empty() && n > 0` in the constructor.
+
+**Alternative: pre-check.** Run one single-threaded Kahn's pass first, O(V+E). If it can't place every node, reject the graph before starting threads. Simpler to reason about, but it walks the graph twice. Runtime detection is free but adds an invariant to the concurrent code.
+
+**Takeaway:** in Kahn's, a cycle means "some nodes are never reached", not "a node is seen twice". Detect it as a stall: `queue empty && active == 0 && done < n`.
+
+## Follow-up 2: Priority scheduling
+
+Each node has a priority; among ready nodes, a free worker should take the highest. Dependency order still comes first.
+
+Example: A(1), B(5), C(10), D(2), E(8), same edges. With one worker: ready {A, B} → B; ready {A, E} → E; then A, C, D. Order: `B E A C D`.
+
+### Part 1: the data structure (I got this)
+
+Replace `queue` with a max-heap, use `top()` instead of `front()`:
+
+```cpp
+priority_queue<pair<int,int>> pq;     // {priority, id}
+auto [p, u] = pq.top(); pq.pop();
+```
+
+The wait predicate, notify after push and termination stay the same.
+
+### Part 2: does it change thread safety or cost? (half right)
+
+Thread safety: no, the same mutex `m` still guards every access. **Cost: yes.** Push and pop go from O(1) to O(log k), and every worker passes through `m` twice per node, so the busiest lock is held longer. Negligible usually, but it matters with many ready nodes and cheap `process()`.
+
+Also, with N workers, priority is **best-effort**: it decides which node *starts* next, not which *finishes* first.
+
+**Can priority break correctness?** No. In-degree decides *whether* a node can run; priority only decides *which* ready node runs first. A node enters the heap only at in-degree 0.
+
+### Problem A: starvation → fix with aging
+
+If high-priority nodes keep arriving, A(1) may never be picked. That's **starvation**. Fix: **aging**, where a waiting node's priority rises over time. (I first called it multi-level feedback; MLFQ is a different OS scheduler that moves tasks between queues based on behavior. It often *uses* aging, but they aren't the same thing.)
+
+Aged priority, with `base` = starting priority and `r` = aging rate:
+
+```latex
+\text{aged} = \text{base} + r\,(\text{now} - \text{enqueueTime}) = (\text{base} - r \cdot \text{enqueueTime}) + r \cdot \text{now}
+```
+
+A heap can't update keys as time passes. The trick: `r × now` is the **same for every node** at any moment, so it never changes who is on top. Sort by the fixed part only, computed once at push time:
+
+```cpp
+double key = base[v] - AGING_RATE * nowSeconds();
+pq.push({key, v});
+```
+
+**no node’s key ever changes after it’s pushed**. What changes is the **starting penalty**. The later a node arrives, the bigger the penalty it starts with:
+
+```
+pushed at t=0    → penalty 0
+pushed at t=8    → penalty 8
+pushed at t=100  → penalty 100
+```
+
+Worked example (r = 1/s). X: base 10, enqueued at t=0. Y: base 15, enqueued at t=8.
+
+**t = 0: push X**
+
+```
+key = 10 − 1×0 = 10
+
+      (10, X)
+```
+
+**t = 8: push Y**
+
+```
+key = 15 − 1×8 = 7
+
+      (10, X)        ← root: picked next
+       /
+   (7, Y)
+
+array: [ (10,X), (7,Y) ]
+```
+
+Y’s key (7) is smaller than X’s (10), so Y goes below X. **Nothing else ever touches these two entries.**
+
+**Check against real aged priority** (`base + r × time waited`):
+
+| now | X aged | Y aged | Winner |
+| --- | --- | --- | --- |
+| 10 | 20 | 17 | X |
+| 20 | 30 | 27 | X |
+| 100 | 110 | 107 | X |
+
+The gap stays at 3, so order never changes. Fixed keys: X = 10 − 0 = 10, Y = 15 − 8 = 7. Same answer, no `now` needed. A new node Z(50) arriving at t=100 gets key −50, so X still beats it. Every waiting node eventually reaches the top.
+
+### Problem B: priority inversion → fix with inheritance (I missed this)
+
+C(10) can't run until A(1) finishes, and A sits at the bottom of the heap. A high-priority node is stuck behind a low-priority one. That's **priority inversion** (the same bug as a low-priority thread holding a lock a high-priority thread needs; it famously reset the Mars Pathfinder lander).
+
+Fix: **priority inheritance**. A node is at least as important as anything waiting on it:
+
+```latex
+\text{inherited}[u] = \max\left(\text{priority}[u],\ \max_{c \in \text{children}(u)} \text{inherited}[c]\right)
+```
+
+Compute it **once, before any node is pushed**, bottom-up in reverse topological order, O(V+E):
+
+```
+order = topological order (one plain Kahn pass)
+inherited = copy of priority
+for u in reverse(order):
+    for c in children[u]:
+        inherited[u] = max(inherited[u], inherited[c])
+```
+
+| Node | Own | Children | Inherited |
+| --- | --- | --- | --- |
+| D | 2 | none | 2 |
+| E | 8 | none | 8 |
+| C | 10 | D | 10 |
+| A | 1 | C | 10 |
+| B | 5 | C, E | 10 |
+
+**Why not compute it at push time?** (my question) It depends on what's *below* the node. At the very first pick between A and B, the worker must already know A blocks C(10). Computing A's value at push time from its own priority gives 1, which is wrong.
+
+### Which value is computed when
+
+| Value | Depends on | Computed |
+| --- | --- | --- |
+| `inherited[u]` | Descendants' priorities | Once, before threads start |
+| Heap key | Inherited priority + when the node became ready | At push time: `inherited[v] - r * now` |
+
+Inheritance fixes inversion; aging fixes starvation.
+
+## Follow-up 3: A dynamic graph
+
+New nodes and edges can be added **while workers are running** (think of a build system where jobs keep arriving). Everything we computed once at the start (`n`, edges, `inherited[]`, in-degrees, "no cycles") can now change.
+
+**How to approach it when stuck:** list what you assumed was fixed, and test each assumption.
+
+| What breaks | Timeline | Fix |
+| --- | --- | --- |
+| Priority goes stale | A is in the heap with key 10; new X(100) is added depending on A | Raise ancestors' priorities, stopping early when one is already high enough. Push A again with the new key; when popping, skip entries whose key doesn't match `currentKey[u]` (lazy deletion) |
+| Edge arrives too late | C is already running; someone adds `P → C` | Give each node a state (WAITING, READY, RUNNING, DONE). Under C's lock: WAITING → `++indegree`; READY → pull it back (mark heap entry stale); RUNNING/DONE → reject the edge |
+| Workers stop too early | All 5 nodes finish, `tot == n`, workers exit; then F arrives | Add a `closed` flag set when no more input is coming. Stop only when `closed && done == n && queue empty`, all read under `m` |
+| New cycle | Adding `P → C` when C can already reach P | Check reachability before accepting the edge, or rely on stall detection |
+| Data race on the graph | A worker iterates `adj[u]` while another thread appends to it; the vector may reallocate | Guard each node's child list with its node lock, or copy the list under the lock before iterating |
+
+Stale-entry check when popping:
+
+```cpp
+auto [k, u] = pq.top(); pq.pop();
+if (k != currentKey[u] || state[u] != READY) continue;   // outdated entry
+```
+
+**Takeaway:** every value that was precomputed or "fixed" becomes shared mutable state, and each needs an owner, a lock and a plan for going stale.
+
+## Cheat sheet
+
+**The worker loop in five steps:** take (wait with predicate) → process (no lock) → record order → release children (atomic or per-node lock, push + notify) → count done (stop + `notify_all` at n).
+
+**Patterns to memorize:**
+
+- Fixed pool of N workers, continuous pulling; never a thread per task.
+- Decrement-and-check must be one atomic step: `if (x.fetch_sub(1) == 1)`.
+- One mutex per piece of data; never copy a mutex (use ids or pointers).
+- The wait predicate and its state live under the same mutex: `cv.wait(lock, [&]{ return !q.empty() || stop; });`
+- After waking, re-check before touching the queue.
+- Notify after every change a waiter cares about.
+- Count completion after the children are pushed; record order before.
+- Cycle in Kahn's = stall: `queue empty && active == 0 && done < n`.
+- Priority: heap + aging (starvation) + inheritance (inversion).
+- Dynamic input: every precomputed value needs a lock and a staleness plan.
+
+**Interview terms:** lost update, lost wakeup, spurious wakeup, poison pill, lock ordering, false sharing, work stealing, starvation, aging, priority inversion, priority inheritance, hazard pointers.
+
+**My feedback from the mock** (lean hire, mid-level):&#32;
+
+- Strong: started from Kahn's, moved to a fixed pool, chose per-node locks for the right reason, ordered the completion count correctly, named starvation.
+- Work on: tracing races step by step (two threads, read/read/write/write); condition-variable mechanics; C++ details that keep code from compiling; precise terms (aging vs MLFQ); bringing up lock cost and priority inversion without being asked.
+- When stuck: say "let me think out loud", list the assumptions, and test each one.
+
+**Next topics to practice:** work-stealing queues, cancellation (a failed node skips its descendants), a timed 35-minute mock with no hints.
